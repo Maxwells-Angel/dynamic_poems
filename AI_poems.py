@@ -2,7 +2,7 @@
 # to keep the end words anchored 
 # So far, simple example of working with transformers to generate some output 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-import torch, einops, random
+import torch, einops, random, math, tqdm
 
 model = AutoModelForCausalLM.from_pretrained("google/gemma-3-1b-it", torch_dtype="auto", device_map="auto")
 tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-1b-it")
@@ -66,64 +66,72 @@ laughing and talking to hide her tears.
 base_input = tokenizer([sestina], return_tensors="pt").to("mps")
 sestina_tokens = base_input['input_ids']
 n_tokens = sestina_tokens.shape[1]
-thresh = .3
-branches_add = 1 
+branch_prob = .01
+path_thresh = 17.0
+branches_add = 100 
 running_input = [None]
 output = []
 
-def sestina_brancher(running_input: str):
-    running_base_input = tokenizer([running_input], return_tensors = "pt").to("mps")
+def sestina_brancher(running_input: torch.Tensor, running_score: list, count_branches: int):
+    if (len(running_score) > 0 and sum(running_score)/len(running_score) < path_thresh):
+        print("Branch killed")
+        return False
+    
+    decoded_running_input = tokenizer.decode(running_input) # return the string version of the running input
+    running_base_input = tokenizer([decoded_running_input], return_tensors = "pt").to("mps")
     token_ids = running_base_input['input_ids']
     curr_position = token_ids.shape[1] # len of str != tokens
     
+    print(curr_position)
     if curr_position >= n_tokens: #base case - if you've finished the whole thing
-        output.append(running_input)
-        return 
+        final_score = 0
+        if (len(running_score) > 0):
+            final_score = sum(running_score)/len(running_score)
+        output.append({"text": running_input, "score": final_score, "branch": count_branches})
+        return True
 
     coin_flip = random.random()
-    if coin_flip < thresh:
+    if coin_flip < branch_prob:
+        print("Branch", count_branches)
         max_len = curr_position+1
-        branches = model.generate(**running_base_input, max_length = max_len) # TODO - figure out how to generate logits 
+
+        generation = model.generate(**running_base_input, max_length = max_len, return_dict_in_generate = True, output_logits = True) # TODO - figure out how to generate logits 
+        good_branch = True
         for i in range(branches_add): 
             # selecting through best words from "branches"
-            #print(branches)
-            new_token = branches[:,-1] #highest ranking 
+            logits = generation.logits[-1].squeeze().sort(descending = True)
+            new_score = running_score + [logits.values[i].item()] # TODO 
+            new_token = logits.indices[i].reshape(1)
             new_word = tokenizer.decode(new_token)
             # TODO - to help with comprehensibility, implement small beam search, i.e., checking if generated next token/word has high probability 
             # of working with the token/word we know comes after it, if not, re-search
             # decode choice and add it to the string with space before - TODO, address some of the edge cases here
-            new_input = running_input + new_word
-            sestina_brancher(new_input)
+            #new_input = running_input + new_word
+            new_input = torch.cat((running_input, new_token))
+            if not sestina_brancher(new_input, new_score, count_branches + 1): 
+                good_branch = False         
+        # if not good_branch:
+        #     new_token = (sestina_tokens[0,curr_position]).reshape(1)
+        #     new_input = torch.cat((running_input, new_token))   
+        #     if not sestina_brancher(new_input, running_score, count_branches): return False
+            
+
     else: 
-        new_token = sestina_tokens[0,curr_position]
-        new_word = tokenizer.convert_ids_to_tokens(new_token.item()) #TODO -- figure out why the tokenizer is not decoding token id -- PROBLEM WITH BOS TOKEN WHERE WE'RE STARTING 
-        new_input = running_input + new_word
-        sestina_brancher(new_input)
-        # call the LLM with the tokens we generated so far 
+        new_token = (sestina_tokens[0,curr_position]).reshape(1)
+        new_word = tokenizer.convert_ids_to_tokens(new_token.item())  
+        # new_input = running_input + new_word
+        new_input = torch.cat((running_input, new_token))
+        if not sestina_brancher(new_input, running_score, count_branches): return False
 
-#sestina_brancher("")
-#print(output)
 
-example_string = "My name is "
-token_string = tokenizer([example_string], return_tensors = "pt").to("mps")
-generation = model.generate(**token_string, max_length = token_string['input_ids'].shape[1]+5, return_dict_in_generate=True, output_logits=True)
-#print("Scores")
-#print(generation.logits[0].shape) # [1,262144]
-#print(generation.logits) # 1, 502303
 
-results1 = generation.logits[-1].squeeze()
-results2 = generation.logits[-2].squeeze()
-sorted_results1 = torch.sort(results1, descending=True)
-sorted_results2 = torch.sort(results2, descending=True)
-#print(sorted_results.indices)
+sestina_brancher(sestina_tokens[0,:2].squeeze(),[],0)
+# print(output)
 
-for tok in sorted_results1.indices[:4]:
-    print(tok)
-    print(tokenizer.convert_ids_to_tokens(tok.item()))
+for dic in output: 
+    print(tokenizer.decode(dic['text']))
+    print(dic["score"])
 
-for tok in sorted_results2.indices[:4]:
-    print(tok)
-    print(tokenizer.convert_ids_to_tokens(tok.item()))
-
+print("Complete")
 #print("Sequences?")
 #print(generation.sequences)
